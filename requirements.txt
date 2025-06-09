@@ -12,3 +12,4 @@ torch
 torchvision
 pillow
 typing-extensions==4.5.0
+moviepy
