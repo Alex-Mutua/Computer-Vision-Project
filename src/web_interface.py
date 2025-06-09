@@ -2,32 +2,25 @@ import streamlit as st
 import os
 import cv2 as cv
 import pandas as pd
-import numpy as np
 import tempfile
 import sys
 import shutil
 import time
 import logging
-
-# Set page config as the first Streamlit command
-st.set_page_config(
-    page_title="🚨 Object Detector",
-    page_icon="🚗",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import numpy as np
 
 # Add project directory to Python path
-base_dir = "/home/students/Documents/projet-aims"
+base_dir = "/mount/src/computer-vision-project"
 sys.path.append(os.path.join(base_dir, "src"))
 
 try:
     from detect_track import Detector
     from evaluate_metrics import evaluate_detections
     from heatmap_generator import generate_heatmap
-    from audio_processor import extract_audio, detect_siren
+    from audio_filter import AudioFilter
+    from motion_estimator import MotionEstimator
 except ImportError as e:
-    st.error(f"Module not found: {e}. Ensure detect_track.py, evaluate_metrics.py, heatmap_generator.py, and audio_processor.py are in ~/Documents/projet-aims/src/.")
+    st.error(f"Module not found: {e}. Ensure detect_track.py, evaluate_metrics.py, heatmap_generator.py, audio_filter.py, and motion_estimator.py are in {os.path.join(base_dir, 'src')}/.")
     st.stop()
 
 # Set up logging
@@ -210,7 +203,7 @@ def create_groundtruth_template(input_csv, output_csv):
         df = pd.read_csv(input_csv)
         if df.empty or len(df) <= 1:
             st.warning("position_log.csv is empty. Ground truth template will be empty.")
-        df = df[["timestamp_ms", "class", "x_min", "y_min", "x_max", "y_max"]]
+        df = df[["timestamp_ms", "track_id", "class", "x_min", "y_min", "x_max", "y_max"]]
         df.to_csv(output_csv, index=False)
         return output_csv
     except Exception as e:
@@ -243,54 +236,6 @@ def filter_csv_by_timestamps(predictions_csv, groundtruth_csv):
         st.error(f"Error filtering CSVs: {e}")
         return None, None
 
-def analyze_motion(position_log_path):
-    try:
-        df = pd.read_csv(position_log_path)
-        if df.empty:
-            return None
-        df["x_center"] = (df["x_min"] + df["x_max"]) / 2
-        df["y_center"] = (df["y_min"] + df["y_max"]) / 2
-        motion_data = []
-        for track_id in df["track_id"].unique():
-            track = df[df["track_id"] == track_id].sort_values("timestamp_ms")
-            if len(track) < 2:
-                continue
-            for i in range(1, len(track)):
-                dx = track.iloc[i]["x_center"] - track.iloc[i-1]["x_center"]
-                dy = track.iloc[i]["y_center"] - track.iloc[i-1]["y_center"]
-                dt = (track.iloc[i]["timestamp_ms"] - track.iloc[i-1]["timestamp_ms"]) / 1000
-                if dt == 0:
-                    continue
-                angle = np.arctan2(dy, dx) * 180 / np.pi
-                direction = "right" if 45 <= angle < 135 else "down" if 135 <= angle < 225 else \
-                    "left" if 225 <= angle < 315 else "up"
-                speed = np.sqrt(dx**2 + dy**2) / dt
-                motion_data.append({
-                    "track_id": track_id,
-                    "class": track.iloc[i]["class"],
-                    "timestamp_ms": track.iloc[i]["timestamp_ms"],
-                    "direction": direction,
-                    "speed_pps": speed
-                })
-        return pd.DataFrame(motion_data)
-    except Exception as e:
-        logger.error(f"Error analyzing motion: {e}")
-        st.error(f"Error analyzing motion: {e}")
-        return None
-
-def check_display_environment():
-    display = os.environ.get('DISPLAY')
-    if not display:
-        return False, "DISPLAY environment variable is not set. Run 'export DISPLAY=:0' in your terminal."
-    try:
-        img = cv.Mat.zeros((100, 100, 3), dtype=cv.uint8)
-        cv.imshow('Test', img)
-        cv.waitKey(1)
-        cv.destroyAllWindows()
-        return True, "Display environment is functional."
-    except Exception as e:
-        return False, f"OpenCV GUI test failed: {e}. Ensure libgtk-3-dev is installed and X11 is running."
-
 def main():
     st.markdown("""
     <div class="main-header">
@@ -298,7 +243,6 @@ def main():
         <p>Real-time detection and tracking of objects using YOLOv11 with Audio and Motion Analysis</p>
         <div style="margin-top: 1rem;">
             <span class="status-badge">YOLOv11 Ready</span>
-            <span class="status-badge">Audio Enabled</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -336,21 +280,15 @@ def main():
             ["all"] + model_info["classes"],
             help="Select the object to detect (or 'all' for all classes)"
         )
-        confidence = st.slider("Confidence Threshold", 0.01, 0.0, 0.25, step=0.01, help="Set to 0.01 for maximum detections")
-        enable_audio_filter = st.checkbox("Enable Siren Detection for Police Cars", value=True, help="Filter car/police car detections based on siren sounds")
-        enable_live_window = st.checkbox("Enable Live Detection Window", value=False, help="Check to open a live OpenCV window during processing (requires GTK/X11 setup)")
-
-        if enable_live_window:
-            display_ok, display_message = check_display_environment()
-            if not display_ok:
-                st.warning(f"Live detection window may not work: {display_message}")
-                logger.warning(f"Display check failed: {display_message}")
+        confidence = st.slider("Confidence Threshold", 0.01, 0.9, 0.01, step=0.01, help="Set to 0.01 for maximum detections")
+        enable_audio_filter = st.checkbox("Enable Siren-Based Filtering", value=True, help="Filter car/police car detections based on siren sounds")
+        enable_live_window = st.checkbox("Enable Live Detection Window", value=False, help="Open a live OpenCV window (requires GTK/X11 setup)")
 
         st.markdown("### 📊 Evaluation Settings")
         ground_truth_file = st.file_uploader(
             "Upload Ground Truth CSV",
             type=["csv"],
-            help="CSV with columns: timestamp_ms, class, x_min, y_min, x_max, y_max. Download the template below."
+            help="CSV with columns: timestamp_ms, track_id, class, x_min, y_min, x_max, y_max. Download the template below."
         )
         iou_threshold = st.slider("IoU Threshold", 0.1, 0.9, 0.5, step=0.05)
         time_threshold = st.number_input("Time Threshold (ms)", 0, 1000, 100)
@@ -360,7 +298,7 @@ def main():
     with col1:
         st.markdown("### 📤 Upload & Process Video")
         
-        st.markdown('<div class="upload-zone">')
+        st.markdown('<div class="upload-zone">', unsafe_allow_html=True)
         uploaded_video = st.file_uploader(
             "Upload a video for detection",
             type=['mp4', 'avi', 'mov'],
@@ -373,30 +311,37 @@ def main():
             tfile.write(uploaded_video.read())
             tfile.close()
 
-            audio_path = None
-            if enable_audio_filter and target_object in ["all", "car", "police car"]:
-                audio_path = extract_audio(tfile.name, OUTPUT_DIR)
-                if audio_path:
-                    st.success(f"Audio extracted to: {audio_path}")
-                else:
-                    st.warning("Failed to extract audio. Skipping siren-based filtering.")
-
             cap = cv.VideoCapture(tfile.name)
             if cap.isOpened():
                 ret, frame = cap.read()
-                if ret:
-                    frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-                    st.image(frame_rgb, caption="📹 Video Preview (First Frame)", use_container_width=True)
-                    st.markdown(f"""
-                    **Video Information:**
-                    - Size: {int(cap.get(cv.CAP_PROP_FRAME_WIDTH))} x {int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))} pixels
-                    - FPS: {int(cap.get(cv.CAP_PROP_FPS))}
-                    - Duration: {cap.get(cv.CAP_PROP_FRAME_COUNT) / cap.get(cv.CAP_PROP_FPS):.2f} seconds
-                    """)
+                if ret and frame is not None and frame.size > 0:
+                    try:
+                        frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+                        # Validate frame_rgb
+                        if not isinstance(frame_rgb, np.ndarray) or frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
+                            raise ValueError(f"Invalid RGB frame: shape={frame_rgb.shape if hasattr(frame_rgb, 'shape') else 'None'}, dtype={frame_rgb.dtype if hasattr(frame_rgb, 'dtype') else 'None'}")
+                        if frame_rgb.dtype != np.uint8:
+                            frame_rgb = frame_rgb.astype(np.uint8)
+                        try:
+                            st.image(frame_rgb, caption="📹 Video Preview (First Frame)", use_container_width=True)
+                        except Exception as e:
+                            logger.error(f"Error displaying video preview: {e}")
+                            st.error(f"Failed to display video preview: {e}")
+                        st.markdown(f"""
+                        **Video Information:**
+                        - Size: {int(cap.get(cv.CAP_PROP_FRAME_WIDTH))} x {int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))} pixels
+                        - FPS: {int(cap.get(cv.CAP_PROP_FPS))}
+                        - Duration: {cap.get(cv.CAP_PROP_FRAME_COUNT) / cap.get(cv.CAP_PROP_FPS):.2f} seconds
+                        """)
+                    except Exception as e:
+                        logger.error(f"Error processing video frame: {e}")
+                        st.error(f"Error processing video frame: {e}")
                 else:
-                    st.warning("Could not read video frames. Check video format.")
+                    logger.error("Failed to read video frame: ret=False or frame is empty")
+                    st.error("Could not read video frame. Check if the video is valid and contains frames.")
                 cap.release()
             else:
+                logger.error("Failed to open video file")
                 st.error("Failed to open video file. Ensure it’s a valid MP4, AVI, or MOV.")
 
             if st.button("🚀 Process Video", type="primary"):
@@ -413,8 +358,7 @@ def main():
                         detector_params = {
                             "filepath": tfile.name,
                             "target_object": target_object,
-                            "no_window": not enable_live_window,
-                            "output_dir": OUTPUT_DIR
+                            "no_window": not enable_live_window
                         }
                         detector = Detector(**detector_params)
 
@@ -425,8 +369,6 @@ def main():
                         start_time = time.time()
 
                         try:
-                            if enable_live_window:
-                                logger.info("Attempting to initialize live detection window")
                             detector.process_video(confidence=confidence)
                             for i in range(101):
                                 progress_bar.progress(i)
@@ -434,13 +376,10 @@ def main():
                         except Exception as e:
                             logger.error(f"Detector processing failed: {e}")
                             if enable_live_window:
-                                st.warning("Live detection window failed to open. Ensure GTK/X11 is installed, DISPLAY is set (e.g., 'export DISPLAY=:0'), and check console logs for OpenCV errors.")
+                                st.warning("Live detection window failed to open. Ensure GTK/X11 is installed and DISPLAY is set (e.g., 'export DISPLAY=:0').")
                             raise e
                         finally:
                             progress_bar.empty()
-                            if enable_live_window:
-                                cv.destroyAllWindows()
-                                logger.info("Closed all OpenCV windows")
 
                         st.info("Video processing completed.")
                         processing_time = time.time() - start_time
@@ -449,17 +388,15 @@ def main():
                         if os.path.exists(detector_processed_video_path):
                             shutil.copy(detector_processed_video_path, processed_video_path)
                             st.success("Video processed successfully!")
-                            try:
-                                st.video(processed_video_path)
-                            except Exception as e:
-                                st.warning(f"Unable to display video: {e}. Try downloading it.")
                             with open(processed_video_path, "rb") as f:
-                                st.download_button(
-                                    label="📥 Download Processed Video",
-                                    data=f,
-                                    file_name="processed_video.mp4",
-                                    mime="video/mp4"
-                                )
+                                video_bytes = f.read()
+                            st.video(video_bytes, format="video/mp4")
+                            st.download_button(
+                                label="📥 Download Processed Video",
+                                data=video_bytes,
+                                file_name="processed_video.mp4",
+                                mime="video/mp4"
+                            )
                         else:
                             st.error(f"Processed video not found at {detector_processed_video_path}. Check Detector output or console logs.")
 
@@ -477,32 +414,40 @@ def main():
                         else:
                             st.warning(f"Position log not found at {detector_position_log_path}. Ensure Detector is saving outputs correctly.")
 
-                        if enable_audio_filter and target_object in ["all", "car", "police car"] and audio_path and is_valid_csv(position_log_path):
+                        if enable_audio_filter and target_object in ["all", "car", "police car"] and is_valid_csv(position_log_path):
                             df = pd.read_csv(position_log_path)
                             if not df[df['class'].str.lower().isin(['car', 'police car'])].empty:
-                                if detect_siren(audio_path):
-                                    filtered_df = df[df['class'].str.lower() == 'police car']
-                                    filtered_log_path = os.path.join(OUTPUT_DIR, "filtered_position_log.csv")
-                                    filtered_df.to_csv(filtered_log_path, index=False)
-                                    st.info("Audio-based filtering completed. Only police car detections kept due to siren detection.")
+                                audio_filter = AudioFilter(tfile.name, output_dir=OUTPUT_DIR)
+                                if audio_filter.extract_audio():
+                                    if audio_filter.detect_sirens():
+                                        audio_filter.filter_detections()
+                                        st.info("Audio-based filtering completed.")
+                                    else:
+                                        st.warning("No sirens detected. Filtered log may be empty.")
+                                    audio_filter.cleanup()
                                 else:
-                                    st.warning("No sirens detected. Filtered log may be empty.")
-                                    filtered_log_path = os.path.join(OUTPUT_DIR, "filtered_position_log.csv")
-                                    df.to_csv(filtered_log_path, index=False)
+                                    st.warning("Audio extraction failed. Skipping siren-based filtering.")
                             else:
                                 st.warning("No car/police car detections to filter. Skipping audio analysis.")
+                            filtered_log_path = os.path.join(OUTPUT_DIR, "filtered_position_log.csv")
+                            if os.path.exists(filtered_log_path):
+                                shutil.copy(filtered_log_path, os.path.join(OUTPUT_DIR, "filtered_position_log.csv"))
+                        elif enable_audio_filter:
+                            st.info("Skipping audio filtering: no valid detections or irrelevant target object.")
 
                         input_csv = os.path.join(OUTPUT_DIR, "filtered_position_log.csv" if enable_audio_filter and is_valid_csv(os.path.join(OUTPUT_DIR, "filtered_position_log.csv")) else "position_log.csv")
                         if is_valid_csv(input_csv):
-                            motion_data = analyze_motion(input_csv)
-                            if motion_data is not None and not motion_data.empty:
-                                st.info("Motion analysis completed.")
-                                motion_path = os.path.join(OUTPUT_DIR, "motion_data.csv")
-                                motion_data.to_csv(motion_path, index=False)
+                            df = pd.read_csv(input_csv)
+                            if not df[df['class'].str.lower().isin(['car', 'police car'])].empty:
+                                motion_estimator = MotionEstimator(input_csv, output_dir=OUTPUT_DIR)
+                                if motion_estimator.estimate_movement():
+                                    st.info("Motion estimation completed.")
+                                else:
+                                    st.warning("No valid car/police car tracks for motion analysis.")
                             else:
-                                st.warning("No valid car/police car tracks for motion analysis.")
+                                st.warning("No car/police car detections in input CSV. Skipping motion estimation.")
                         else:
-                            st.warning(f"No valid input CSV at {input_csv}. Skipping motion analysis.")
+                            st.warning(f"No valid input CSV at {input_csv}. Skipping motion estimation.")
 
                         if is_valid_csv(position_log_path):
                             try:
@@ -581,18 +526,18 @@ def main():
                     else:
                         st.info("No siren-based filtered detections available. Ensure video has siren sounds and car/police car detections.")
 
-                    motion_path = os.path.join(PREDICTIONS_DIR, "motion_data.csv")
-                    if is_valid_csv(motion_path):
+                    motion_log_path = os.path.join(PREDICTIONS_DIR, "motion_log.csv")
+                    if is_valid_csv(motion_log_path):
                         st.markdown("#### 🚗 Motion Analysis")
-                        motion_df = pd.read_csv(motion_path)
-                        st.dataframe(motion_df[["track_id", "class", "timestamp_ms", "direction", "speed_pps"]])
+                        motion_df = pd.read_csv(motion_log_path)
+                        st.dataframe(motion_df)
                         if motion_df.empty:
                             st.info("Motion log is empty. Ensure car/police car tracks are detected.")
-                        with open(motion_path, "rb") as f:
+                        with open(motion_log_path, "rb") as f:
                             st.download_button(
                                 label="📥 Download Motion Log",
                                 data=f,
-                                file_name="motion_data.csv",
+                                file_name="motion_log.csv",
                                 mime="text/csv"
                             )
                     else:
@@ -628,7 +573,6 @@ def main():
                                         ground_truth_file=gt_temp.name,
                                         predictions_file=pred_temp.name,
                                         output_file=os.path.join(PREDICTIONS_DIR, "evaluation_report.txt"),
-                                        audio_path=audio_path if enable_audio_filter else None,
                                         iou_threshold=iou_threshold,
                                         time_threshold=time_threshold
                                     )
@@ -676,11 +620,6 @@ def main():
                                 st.error(f"Error evaluating detections: {e}")
                             finally:
                                 os.unlink(gt_tfile.name)
-
-                    if enable_audio_filter and audio_path:
-                        siren_detected = detect_siren(audio_path)
-                        st.markdown(f"<span class='status-badge'>Siren Detected: {siren_detected}</span>", unsafe_allow_html=True)
-
                 except Exception as e:
                     logger.error(f"Error loading detection results: {e}")
                     st.error(f"Error loading detection results: {e}")
@@ -700,16 +639,17 @@ def main():
         - Well-lit, minimal occlusion
         
         **Ground Truth CSV:**
-        - Columns: timestamp_ms, class, x_min, y_min, x_max, y_max
+        - Columns: timestamp_ms, track_id, class, x_min, y_min, x_max, y_max
         - Classes: traffic light, police car, car, person, bus, truck, bicycle, motorcycle
         - Use the template provided
         
         **Model Settings:**
         - Model: YOLOv11n at resources/models/yolo11n.pt
-        - Outputs: predictions/position_log.csv, filtered_position_log.csv, motion_data.csv
+        - Outputs: predictions/position_log.csv, filtered_position_log.csv, motion_log.csv
         - Confidence: Use 0.01 for testing, increase if too many false positives
-        - Siren Detection: Requires clear siren audio and siren_cnn.h5 model
-        - Live Window: Requires libgtk-3-dev, DISPLAY=:0 (run 'export DISPLAY=:0' before Streamlit), and OpenCV GUI support
+        - Siren Filtering: Requires clear siren audio
+        - Motion Analysis: Needs multiple frames per car track
+        - Live Window: Requires libgtk-3-dev and DISPLAY=:0 (run 'export DISPLAY=:0' before Streamlit)
         """)
 
     st.markdown("---")
