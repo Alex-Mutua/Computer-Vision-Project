@@ -13,4 +13,4 @@ torch
 torchvision
 pillow
 moviepy
-audio_filter
+audio-filter
