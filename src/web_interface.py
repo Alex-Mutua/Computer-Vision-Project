@@ -13,15 +13,30 @@ import numpy as np
 base_dir = "/mount/src/computer-vision-project"
 sys.path.append(os.path.join(base_dir, "src"))
 
+# Import required modules
 try:
     from detect_track import Detector
     from evaluate_metrics import evaluate_detections
     from heatmap_generator import generate_heatmap
+except ImportError as e:
+    st.error(f"Module not found: {e}. Ensure detect_track.py, evaluate_metrics.py, and heatmap_generator.py are in {os.path.join(base_dir, 'src')}/.")
+    st.stop()
+
+# Import AudioFilter conditionally
+AudioFilter = None
+try:
     from audio_filter import AudioFilter
+except ImportError as e:
+    st.warning(f"AudioFilter module not found: {e}. Siren-based filtering will be disabled. Ensure audio_filter.py is in {os.path.join(base_dir, 'src')}/ to enable it.")
+    logger.warning("AudioFilter module not found. Siren-based filtering is disabled.")
+
+# Import MotionEstimator conditionally
+MotionEstimator = None
+try:
     from motion_estimator import MotionEstimator
 except ImportError as e:
-    st.error(f"Module not found: {e}. Ensure detect_track.py, evaluate_metrics.py, heatmap_generator.py, audio_filter.py, and motion_estimator.py are in {os.path.join(base_dir, 'src')}/.")
-    st.stop()
+    st.warning(f"MotionEstimator module not found: {e}. Motion analysis will be disabled. Ensure motion_estimator.py is in {os.path.join(base_dir, 'src')}/ to enable it.")
+    logger.warning("MotionEstimator module not found. Motion analysis is disabled.")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -159,7 +174,7 @@ st.markdown("""
         border-radius: 15px;
         padding: 2rem;
         text-align: center;
-        background: rgba(255, 107, 107, 0.05);
+        background: rgba(255, 255, 255, 0.05);
         transition: all 0.3s ease;
     }
     
@@ -281,7 +296,8 @@ def main():
             help="Select the object to detect (or 'all' for all classes)"
         )
         confidence = st.slider("Confidence Threshold", 0.01, 0.9, 0.01, step=0.01, help="Set to 0.01 for maximum detections")
-        enable_audio_filter = st.checkbox("Enable Siren-Based Filtering", value=True, help="Filter car/police car detections based on siren sounds")
+        enable_audio_filter = st.checkbox("Enable Siren-Based Filtering", value=False, help="Filter car/police car detections based on siren sounds. Requires audio_filter.py.")
+        enable_motion_estimation = st.checkbox("Enable Motion Estimation", value=False, help="Estimate movement for car/police car detections. Requires motion_estimator.py.")
         enable_live_window = st.checkbox("Enable Live Detection Window", value=False, help="Open a live OpenCV window (requires GTK/X11 setup)")
 
         st.markdown("### 📊 Evaluation Settings")
@@ -317,7 +333,6 @@ def main():
                 if ret and frame is not None and frame.size > 0:
                     try:
                         frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-                        # Validate frame_rgb
                         if not isinstance(frame_rgb, np.ndarray) or frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
                             raise ValueError(f"Invalid RGB frame: shape={frame_rgb.shape if hasattr(frame_rgb, 'shape') else 'None'}, dtype={frame_rgb.dtype if hasattr(frame_rgb, 'dtype') else 'None'}")
                         if frame_rgb.dtype != np.uint8:
@@ -415,39 +430,45 @@ def main():
                             st.warning(f"Position log not found at {detector_position_log_path}. Ensure Detector is saving outputs correctly.")
 
                         if enable_audio_filter and target_object in ["all", "car", "police car"] and is_valid_csv(position_log_path):
-                            df = pd.read_csv(position_log_path)
-                            if not df[df['class'].str.lower().isin(['car', 'police car'])].empty:
-                                audio_filter = AudioFilter(tfile.name, output_dir=OUTPUT_DIR)
-                                if audio_filter.extract_audio():
-                                    if audio_filter.detect_sirens():
-                                        audio_filter.filter_detections()
-                                        st.info("Audio-based filtering completed.")
-                                    else:
-                                        st.warning("No sirens detected. Filtered log may be empty.")
-                                    audio_filter.cleanup()
-                                else:
-                                    st.warning("Audio extraction failed. Skipping siren-based filtering.")
+                            if AudioFilter is None:
+                                st.warning("AudioFilter module is not available. Skipping siren-based filtering.")
                             else:
-                                st.warning("No car/police car detections to filter. Skipping audio analysis.")
-                            filtered_log_path = os.path.join(OUTPUT_DIR, "filtered_position_log.csv")
-                            if os.path.exists(filtered_log_path):
-                                shutil.copy(filtered_log_path, os.path.join(OUTPUT_DIR, "filtered_position_log.csv"))
+                                df = pd.read_csv(position_log_path)
+                                if not df[df['class'].str.lower().isin(['car', 'police car'])].empty:
+                                    audio_filter = AudioFilter(tfile.name, output_dir=OUTPUT_DIR)
+                                    if audio_filter.extract_audio():
+                                        if audio_filter.detect_sirens():
+                                            audio_filter.filter_detections()
+                                            st.info("Audio-based filtering completed.")
+                                        else:
+                                            st.warning("No sirens detected. Filtered log may be empty.")
+                                        audio_filter.cleanup()
+                                    else:
+                                        st.warning("Audio extraction failed. Skipping siren-based filtering.")
+                                else:
+                                    st.warning("No car/police car detections to filter. Skipping audio analysis.")
+                                filtered_log_path = os.path.join(OUTPUT_DIR, "filtered_position_log.csv")
+                                if os.path.exists(filtered_log_path):
+                                    shutil.copy(filtered_log_path, os.path.join(OUTPUT_DIR, "filtered_position_log.csv"))
                         elif enable_audio_filter:
                             st.info("Skipping audio filtering: no valid detections or irrelevant target object.")
 
-                        input_csv = os.path.join(OUTPUT_DIR, "filtered_position_log.csv" if enable_audio_filter and is_valid_csv(os.path.join(OUTPUT_DIR, "filtered_position_log.csv")) else "position_log.csv")
-                        if is_valid_csv(input_csv):
-                            df = pd.read_csv(input_csv)
-                            if not df[df['class'].str.lower().isin(['car', 'police car'])].empty:
-                                motion_estimator = MotionEstimator(input_csv, output_dir=OUTPUT_DIR)
-                                if motion_estimator.estimate_movement():
-                                    st.info("Motion estimation completed.")
-                                else:
-                                    st.warning("No valid car/police car tracks for motion analysis.")
+                        input_csv = os.path.join(OUTPUT_DIR, "filtered_position_log.csv" if enable_audio_filter and AudioFilter is not None and is_valid_csv(os.path.join(OUTPUT_DIR, "filtered_position_log.csv")) else "position_log.csv")
+                        if enable_motion_estimation and is_valid_csv(input_csv):
+                            if MotionEstimator is None:
+                                st.warning("MotionEstimator module is not available. Skipping motion estimation.")
                             else:
-                                st.warning("No car/police car detections in input CSV. Skipping motion estimation.")
-                        else:
-                            st.warning(f"No valid input CSV at {input_csv}. Skipping motion estimation.")
+                                df = pd.read_csv(input_csv)
+                                if not df[df['class'].str.lower().isin(['car', 'police car'])].empty:
+                                    motion_estimator = MotionEstimator(input_csv, output_dir=OUTPUT_DIR)
+                                    if motion_estimator.estimate_movement():
+                                        st.info("Motion estimation completed.")
+                                    else:
+                                        st.warning("No valid car/police car tracks for motion analysis.")
+                                else:
+                                    st.warning("No car/police car detections in input CSV. Skipping motion estimation.")
+                        elif enable_motion_estimation:
+                            st.info("Skipping motion estimation: no valid input CSV or irrelevant target object.")
 
                         if is_valid_csv(position_log_path):
                             try:
@@ -635,7 +656,7 @@ def main():
         - Formats: MP4, AVI, MOV
         - Duration: At least 1 minute
         - Clear visibility of cars/police cars
-        - Siren sounds for audio filtering
+        - Siren sounds for audio filtering (requires audio_filter.py)
         - Well-lit, minimal occlusion
         
         **Ground Truth CSV:**
@@ -647,8 +668,8 @@ def main():
         - Model: YOLOv11n at resources/models/yolo11n.pt
         - Outputs: predictions/position_log.csv, filtered_position_log.csv, motion_log.csv
         - Confidence: Use 0.01 for testing, increase if too many false positives
-        - Siren Filtering: Requires clear siren audio
-        - Motion Analysis: Needs multiple frames per car track
+        - Siren Filtering: Requires clear siren audio and audio_filter.py
+        - Motion Analysis: Requires motion_estimator.py and multiple frames per car track
         - Live Window: Requires libgtk-3-dev and DISPLAY=:0 (run 'export DISPLAY=:0' before Streamlit)
         """)
 
